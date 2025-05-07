@@ -68,6 +68,7 @@ import {
   getFragmentParentHostFiber,
   getNextSiblingHostFiber,
   getInstanceFromHostFiber,
+  traverseFragmentInstanceDeeply,
 } from 'react-reconciler/src/ReactFiberTreeReflection';
 
 export {detachDeletedInstance};
@@ -2597,6 +2598,7 @@ export type FragmentInstanceType = {
     listener: EventListener,
     optionsOrUseCapture?: EventListenerOptionsOrUseCapture,
   ): void,
+  dispatchEvent(event: Event): boolean,
   focus(focusOptions?: FocusOptions): void,
   focusLast(focusOptions?: FocusOptions): void,
   blur(): void,
@@ -2694,11 +2696,48 @@ function removeEventListenerFromChild(
   return false;
 }
 // $FlowFixMe[prop-missing]
+FragmentInstance.prototype.dispatchEvent = function (
+  this: FragmentInstanceType,
+  event: Event,
+): boolean {
+  const parentHostFiber = getFragmentParentHostFiber(this._fragmentFiber);
+  if (parentHostFiber === null) {
+    return true;
+  }
+  const parentHostInstance =
+    getInstanceFromHostFiber<Instance>(parentHostFiber);
+  const eventListeners = this._eventListeners;
+  if (
+    (eventListeners !== null && eventListeners.length > 0) ||
+    !event.bubbles
+  ) {
+    const temp = document.createTextNode('');
+    if (eventListeners) {
+      for (let i = 0; i < eventListeners.length; i++) {
+        const {type, listener, optionsOrUseCapture} = eventListeners[i];
+        temp.addEventListener(type, listener, optionsOrUseCapture);
+      }
+    }
+    parentHostInstance.appendChild(temp);
+    const cancelable = temp.dispatchEvent(event);
+    if (eventListeners) {
+      for (let i = 0; i < eventListeners.length; i++) {
+        const {type, listener, optionsOrUseCapture} = eventListeners[i];
+        temp.removeEventListener(type, listener, optionsOrUseCapture);
+      }
+    }
+    parentHostInstance.removeChild(temp);
+    return cancelable;
+  } else {
+    return parentHostInstance.dispatchEvent(event);
+  }
+};
+// $FlowFixMe[prop-missing]
 FragmentInstance.prototype.focus = function (
   this: FragmentInstanceType,
   focusOptions?: FocusOptions,
 ): void {
-  traverseFragmentInstance(
+  traverseFragmentInstanceDeeply(
     this._fragmentFiber,
     setFocusOnFiberIfFocusable,
     focusOptions,
@@ -2717,7 +2756,11 @@ FragmentInstance.prototype.focusLast = function (
   focusOptions?: FocusOptions,
 ): void {
   const children: Array<Fiber> = [];
-  traverseFragmentInstance(this._fragmentFiber, collectChildren, children);
+  traverseFragmentInstanceDeeply(
+    this._fragmentFiber,
+    collectChildren,
+    children,
+  );
   for (let i = children.length - 1; i >= 0; i--) {
     const child = children[i];
     if (setFocusOnFiberIfFocusable(child, focusOptions)) {
