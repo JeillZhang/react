@@ -20,10 +20,11 @@ import {inferReactiveScopeVariables} from '../ReactiveScopes';
 import {rewriteInstructionKindsBasedOnReassignment} from '../SSA';
 import {inferMutableRanges} from './InferMutableRanges';
 import inferReferenceEffects from './InferReferenceEffects';
-import {assertExhaustive} from '../Utils/utils';
+import {assertExhaustive, retainWhere} from '../Utils/utils';
 import {inferMutationAliasingEffects} from './InferMutationAliasingEffects';
-import {inferMutationAliasingFunctionEffects} from './InferMutationAliasingFunctionEffects';
+import {inferFunctionExpressionAliasingEffectsSignature} from './InferFunctionExpressionAliasingEffectsSignature';
 import {inferMutationAliasingRanges} from './InferMutationAliasingRanges';
+import {hashEffect} from './AliasingEffects';
 
 export default function analyseFunctions(func: HIRFunction): void {
   for (const [_, block] of func.body.blocks) {
@@ -71,7 +72,7 @@ function lowerWithMutationAliasing(fn: HIRFunction): void {
   inferMutationAliasingRanges(fn, {isFunctionExpression: true});
   rewriteInstructionKindsBasedOnReassignment(fn);
   inferReactiveScopeVariables(fn);
-  const effects = inferMutationAliasingFunctionEffects(fn);
+  const effects = inferFunctionExpressionAliasingEffectsSignature(fn);
   fn.env.logger?.debugLogIRs?.({
     kind: 'hir',
     name: 'AnalyseFunction (inner)',
@@ -80,6 +81,17 @@ function lowerWithMutationAliasing(fn: HIRFunction): void {
   if (effects != null) {
     fn.aliasingEffects ??= [];
     fn.aliasingEffects?.push(...effects);
+  }
+  if (fn.aliasingEffects != null) {
+    const seen = new Set<string>();
+    retainWhere(fn.aliasingEffects, effect => {
+      const hash = hashEffect(effect);
+      if (seen.has(hash)) {
+        return false;
+      }
+      seen.add(hash);
+      return true;
+    });
   }
 
   /**

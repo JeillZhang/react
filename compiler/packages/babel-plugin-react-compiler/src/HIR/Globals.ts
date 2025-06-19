@@ -5,7 +5,7 @@
  * LICENSE file in the root directory of this source tree.
  */
 
-import {Effect, makeIdentifierId, ValueKind, ValueReason} from './HIR';
+import {Effect, ValueKind, ValueReason} from './HIR';
 import {
   BUILTIN_SHAPES,
   BuiltInArrayId,
@@ -34,7 +34,6 @@ import {
   addFunction,
   addHook,
   addObject,
-  signatureArgument,
 } from './ObjectShape';
 import {BuiltInType, ObjectType, PolyType} from './Types';
 import {TypeConfig} from './TypeSchema';
@@ -646,35 +645,35 @@ const REACT_APIS: Array<[string, BuiltInType]> = [
         hookKind: 'useEffect',
         returnValueKind: ValueKind.Frozen,
         aliasing: {
-          receiver: makeIdentifierId(0),
+          receiver: '@receiver',
           params: [],
-          rest: makeIdentifierId(1),
-          returns: makeIdentifierId(2),
-          temporaries: [signatureArgument(3)],
+          rest: '@rest',
+          returns: '@returns',
+          temporaries: ['@effect'],
           effects: [
             // Freezes the function and deps
             {
               kind: 'Freeze',
-              value: signatureArgument(1),
+              value: '@rest',
               reason: ValueReason.Effect,
             },
             // Internally creates an effect object that captures the function and deps
             {
               kind: 'Create',
-              into: signatureArgument(3),
+              into: '@effect',
               value: ValueKind.Frozen,
               reason: ValueReason.KnownReturnSignature,
             },
             // The effect stores the function and dependencies
             {
               kind: 'Capture',
-              from: signatureArgument(1),
-              into: signatureArgument(3),
+              from: '@rest',
+              into: '@effect',
             },
             // Returns undefined
             {
               kind: 'Create',
-              into: signatureArgument(2),
+              into: '@returns',
               value: ValueKind.Primitive,
               reason: ValueReason.KnownReturnSignature,
             },
@@ -906,6 +905,7 @@ export function installTypeConfig(
         noAlias: typeConfig.noAlias === true,
         mutableOnlyIfOperandsAreMutable:
           typeConfig.mutableOnlyIfOperandsAreMutable === true,
+        aliasing: typeConfig.aliasing,
       });
     }
     case 'hook': {
@@ -923,6 +923,7 @@ export function installTypeConfig(
         ),
         returnValueKind: typeConfig.returnValueKind ?? ValueKind.Frozen,
         noAlias: typeConfig.noAlias === true,
+        aliasing: typeConfig.aliasing,
       });
     }
     case 'object': {

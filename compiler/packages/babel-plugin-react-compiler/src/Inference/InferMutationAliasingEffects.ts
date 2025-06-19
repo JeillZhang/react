@@ -38,6 +38,7 @@ import {
 import {
   eachInstructionValueLValue,
   eachInstructionValueOperand,
+  eachTerminalOperand,
   eachTerminalSuccessor,
 } from '../HIR/visitors';
 import {Ok, Result} from '../Utils/Result';
@@ -49,6 +50,7 @@ import {
 } from './InferReferenceEffects';
 import {
   assertExhaustive,
+  getOrInsertDefault,
   getOrInsertWith,
   Set_isSuperset,
 } from '../Utils/utils';
@@ -191,16 +193,15 @@ export function inferMutationAliasingEffects(
     hoistedContextDeclarations,
   );
 
-  let count = 0;
+  let iterationCount = 0;
   while (queuedStates.size !== 0) {
-    count++;
-    if (count > 1000) {
-      console.log(
-        'oops infinite loop',
-        fn.id,
-        typeof fn.loc !== 'symbol' ? fn.loc?.filename : null,
-      );
-      throw new Error('infinite loop');
+    iterationCount++;
+    if (iterationCount > 100) {
+      CompilerError.invariant(false, {
+        reason: `[InferMutationAliasingEffects] Potential infinite loop`,
+        description: `A value, temporary place, or effect was not cached properly`,
+        loc: fn.loc,
+      });
     }
     for (const [blockId, block] of fn.body.blocks) {
       const incomingState = queuedStates.get(blockId);
@@ -221,8 +222,19 @@ export function inferMutationAliasingEffects(
   return Ok(undefined);
 }
 
-function findHoistedContextDeclarations(fn: HIRFunction): Set<DeclarationId> {
-  const hoisted = new Set<DeclarationId>();
+function findHoistedContextDeclarations(
+  fn: HIRFunction,
+): Map<DeclarationId, Place | null> {
+  const hoisted = new Map<DeclarationId, Place | null>();
+  function visit(place: Place): void {
+    if (
+      hoisted.has(place.identifier.declarationId) &&
+      hoisted.get(place.identifier.declarationId) == null
+    ) {
+      // If this is the first load of the value, store the location
+      hoisted.set(place.identifier.declarationId, place);
+    }
+  }
   for (const block of fn.body.blocks.values()) {
     for (const instr of block.instructions) {
       if (instr.value.kind === 'DeclareContext') {
@@ -232,9 +244,16 @@ function findHoistedContextDeclarations(fn: HIRFunction): Set<DeclarationId> {
           kind == InstructionKind.HoistedFunction ||
           kind == InstructionKind.HoistedLet
         ) {
-          hoisted.add(instr.value.lvalue.place.identifier.declarationId);
+          hoisted.set(instr.value.lvalue.place.identifier.declarationId, null);
+        }
+      } else {
+        for (const operand of eachInstructionValueOperand(instr.value)) {
+          visit(operand);
         }
       }
+    }
+    for (const operand of eachTerminalOperand(block.terminal)) {
+      visit(operand);
     }
   }
   return hoisted;
@@ -245,19 +264,38 @@ class Context {
   instructionSignatureCache: Map<Instruction, InstructionSignature> = new Map();
   effectInstructionValueCache: Map<AliasingEffect, InstructionValue> =
     new Map();
+  applySignatureCache: Map<
+    AliasingSignature,
+    Map<AliasingEffect, Array<AliasingEffect> | null>
+  > = new Map();
   catchHandlers: Map<BlockId, Place> = new Map();
+  functionSignatureCache: Map<FunctionExpression, AliasingSignature> =
+    new Map();
   isFuctionExpression: boolean;
   fn: HIRFunction;
-  hoistedContextDeclarations: Set<DeclarationId>;
+  hoistedContextDeclarations: Map<DeclarationId, Place | null>;
 
   constructor(
     isFunctionExpression: boolean,
     fn: HIRFunction,
-    hoistedContextDeclarations: Set<DeclarationId>,
+    hoistedContextDeclarations: Map<DeclarationId, Place | null>,
   ) {
     this.isFuctionExpression = isFunctionExpression;
     this.fn = fn;
     this.hoistedContextDeclarations = hoistedContextDeclarations;
+  }
+
+  cacheApplySignature(
+    signature: AliasingSignature,
+    effect: Extract<AliasingEffect, {kind: 'Apply'}>,
+    f: () => Array<AliasingEffect> | null,
+  ): Array<AliasingEffect> | null {
+    const inner = getOrInsertDefault(
+      this.applySignatureCache,
+      signature,
+      new Map(),
+    );
+    return getOrInsertWith(inner, effect, f);
   }
 
   internEffect(effect: AliasingEffect): AliasingEffect {
@@ -314,6 +352,11 @@ function inferBlock(
   } else if (terminal.kind === 'maybe-throw') {
     const handlerParam = context.catchHandlers.get(terminal.handler);
     if (handlerParam != null) {
+      CompilerError.invariant(state.kind(handlerParam) != null, {
+        reason:
+          'Expected catch binding to be intialized with a DeclareLocal Catch instruction',
+        loc: terminal.loc,
+      });
       const effects: Array<AliasingEffect> = [];
       for (const instr of block.instructions) {
         if (
@@ -333,11 +376,13 @@ function inferBlock(
           state.appendAlias(handlerParam, instr.lvalue);
           const kind = state.kind(instr.lvalue).kind;
           if (kind === ValueKind.Mutable || kind == ValueKind.Context) {
-            effects.push({
-              kind: 'Alias',
-              from: instr.lvalue,
-              into: handlerParam,
-            });
+            effects.push(
+              context.internEffect({
+                kind: 'Alias',
+                from: instr.lvalue,
+                into: handlerParam,
+              }),
+            );
           }
         }
       }
@@ -346,11 +391,11 @@ function inferBlock(
   } else if (terminal.kind === 'return') {
     if (!context.isFuctionExpression) {
       terminal.effects = [
-        {
+        context.internEffect({
           kind: 'Freeze',
           value: terminal.value,
           reason: ValueReason.JsxCaptured,
-        },
+        }),
       ];
     }
   }
@@ -426,14 +471,14 @@ function applySignature(
    * Track which values we've already aliased once, so that we can switch to
    * appendAlias() for subsequent aliases into the same value
    */
-  const aliased = new Set<IdentifierId>();
+  const initialized = new Set<IdentifierId>();
 
   if (DEBUG) {
     console.log(printInstruction(instruction));
   }
 
   for (const effect of signature.effects) {
-    applyEffect(context, state, effect, aliased, effects);
+    applyEffect(context, state, effect, initialized, effects);
   }
   if (DEBUG) {
     console.log(
@@ -458,7 +503,7 @@ function applyEffect(
   context: Context,
   state: InferenceState,
   _effect: AliasingEffect,
-  aliased: Set<IdentifierId>,
+  initialized: Set<IdentifierId>,
   effects: Array<AliasingEffect>,
 ): void {
   const effect = context.internEffect(_effect);
@@ -474,6 +519,13 @@ function applyEffect(
       break;
     }
     case 'Create': {
+      CompilerError.invariant(!initialized.has(effect.into.identifier.id), {
+        reason: `Cannot re-initialize variable within an instruction`,
+        description: `Re-initialized ${printPlace(effect.into)} in ${printAliasingEffect(effect)}`,
+        loc: effect.into.loc,
+      });
+      initialized.add(effect.into.identifier.id);
+
       let value = context.effectInstructionValueCache.get(effect);
       if (value == null) {
         value = {
@@ -488,6 +540,7 @@ function applyEffect(
         reason: new Set([effect.reason]),
       });
       state.define(effect.into, value);
+      effects.push(effect);
       break;
     }
     case 'ImmutableCapture': {
@@ -505,6 +558,13 @@ function applyEffect(
       break;
     }
     case 'CreateFrom': {
+      CompilerError.invariant(!initialized.has(effect.into.identifier.id), {
+        reason: `Cannot re-initialize variable within an instruction`,
+        description: `Re-initialized ${printPlace(effect.into)} in ${printAliasingEffect(effect)}`,
+        loc: effect.into.loc,
+      });
+      initialized.add(effect.into.identifier.id);
+
       const fromValue = state.kind(effect.from);
       let value = context.effectInstructionValueCache.get(effect);
       if (value == null) {
@@ -523,29 +583,48 @@ function applyEffect(
       switch (fromValue.kind) {
         case ValueKind.Primitive:
         case ValueKind.Global: {
-          // no need to track this data flow
+          effects.push({
+            kind: 'Create',
+            value: fromValue.kind,
+            into: effect.into,
+            reason: [...fromValue.reason][0] ?? ValueReason.Other,
+          });
           break;
         }
         case ValueKind.Frozen: {
           effects.push({
-            kind: 'ImmutableCapture',
-            from: effect.from,
+            kind: 'Create',
+            value: fromValue.kind,
             into: effect.into,
+            reason: [...fromValue.reason][0] ?? ValueReason.Other,
           });
+          applyEffect(
+            context,
+            state,
+            {
+              kind: 'ImmutableCapture',
+              from: effect.from,
+              into: effect.into,
+            },
+            initialized,
+            effects,
+          );
           break;
         }
         default: {
-          effects.push({
-            // OK: recording information flow
-            kind: 'CreateFrom', // prev Alias
-            from: effect.from,
-            into: effect.into,
-          });
+          effects.push(effect);
         }
       }
       break;
     }
     case 'CreateFunction': {
+      CompilerError.invariant(!initialized.has(effect.into.identifier.id), {
+        reason: `Cannot re-initialize variable within an instruction`,
+        description: `Re-initialized ${printPlace(effect.into)} in ${printAliasingEffect(effect)}`,
+        loc: effect.into.loc,
+      });
+      initialized.add(effect.into.identifier.id);
+
       effects.push(effect);
       /**
        * We consider the function mutable if it has any mutable context variables or
@@ -602,7 +681,7 @@ function applyEffect(
             from: capture,
             into: effect.into,
           },
-          aliased,
+          initialized,
           effects,
         );
       }
@@ -610,6 +689,14 @@ function applyEffect(
     }
     case 'Alias':
     case 'Capture': {
+      CompilerError.invariant(
+        effect.kind === 'Capture' || initialized.has(effect.into.identifier.id),
+        {
+          reason: `Expected destination value to already be initialized within this instruction for Alias effect`,
+          description: `Destination ${printPlace(effect.into)} is not initialized in this instruction`,
+          loc: effect.into.loc,
+        },
+      );
       /*
        * Capture describes potential information flow: storing a pointer to one value
        * within another. If the destination is not mutable, or the source value has
@@ -639,11 +726,17 @@ function applyEffect(
         }
         case ValueKind.Frozen: {
           isMutableReferenceType = false;
-          effects.push({
-            kind: 'ImmutableCapture',
-            from: effect.from,
-            into: effect.into,
-          });
+          applyEffect(
+            context,
+            state,
+            {
+              kind: 'ImmutableCapture',
+              from: effect.from,
+              into: effect.into,
+            },
+            initialized,
+            effects,
+          );
           break;
         }
         default: {
@@ -657,6 +750,13 @@ function applyEffect(
       break;
     }
     case 'Assign': {
+      CompilerError.invariant(!initialized.has(effect.into.identifier.id), {
+        reason: `Cannot re-initialize variable within an instruction`,
+        description: `Re-initialized ${printPlace(effect.into)} in ${printAliasingEffect(effect)}`,
+        loc: effect.into.loc,
+      });
+      initialized.add(effect.into.identifier.id);
+
       /*
        * Alias represents potential pointer aliasing. If the type is a global,
        * a primitive (copy-on-write semantics) then we can prune the effect
@@ -665,11 +765,17 @@ function applyEffect(
       const fromKind = fromValue.kind;
       switch (fromKind) {
         case ValueKind.Frozen: {
-          effects.push({
-            kind: 'ImmutableCapture',
-            from: effect.from,
-            into: effect.into,
-          });
+          applyEffect(
+            context,
+            state,
+            {
+              kind: 'ImmutableCapture',
+              from: effect.from,
+              into: effect.into,
+            },
+            initialized,
+            effects,
+          );
           let value = context.effectInstructionValueCache.get(effect);
           if (value == null) {
             value = {
@@ -705,12 +811,7 @@ function applyEffect(
           break;
         }
         default: {
-          if (aliased.has(effect.into.identifier.id)) {
-            state.appendAlias(effect.into, effect.from);
-          } else {
-            aliased.add(effect.into.identifier.id);
-            state.alias(effect.into, effect.from);
-          }
+          state.assign(effect.into, effect.from);
           effects.push(effect);
           break;
         }
@@ -727,64 +828,71 @@ function applyEffect(
          * We're calling a locally declared function, we already know it's effects!
          * We just have to substitute in the args for the params
          */
-        const signature = buildSignatureFromFunctionExpression(
-          state.env,
-          functionValues[0],
-        );
+        const functionExpr = functionValues[0];
+        let signature = context.functionSignatureCache.get(functionExpr);
+        if (signature == null) {
+          signature = buildSignatureFromFunctionExpression(
+            state.env,
+            functionExpr,
+          );
+          context.functionSignatureCache.set(functionExpr, signature);
+        }
         if (DEBUG) {
           console.log(
             `constructed alias signature:\n${printAliasingSignature(signature)}`,
           );
         }
-        const signatureEffects = computeEffectsForSignature(
-          state.env,
+        const signatureEffects = context.cacheApplySignature(
           signature,
-          effect.into,
-          effect.receiver,
-          effect.args,
-          functionValues[0].loweredFunc.func.context,
-          effect.loc,
+          effect,
+          () =>
+            computeEffectsForSignature(
+              state.env,
+              signature,
+              effect.into,
+              effect.receiver,
+              effect.args,
+              functionExpr.loweredFunc.func.context,
+              effect.loc,
+            ),
         );
         if (signatureEffects != null) {
-          if (DEBUG) {
-            console.log('apply function expression effects');
-          }
           applyEffect(
             context,
             state,
             {kind: 'MutateTransitiveConditionally', value: effect.function},
-            aliased,
+            initialized,
             effects,
           );
           for (const signatureEffect of signatureEffects) {
-            applyEffect(context, state, signatureEffect, aliased, effects);
+            applyEffect(context, state, signatureEffect, initialized, effects);
           }
           break;
         }
       }
-      const signatureEffects =
-        effect.signature?.aliasing != null
-          ? computeEffectsForSignature(
+      let signatureEffects = null;
+      if (effect.signature?.aliasing != null) {
+        const signature = effect.signature.aliasing;
+        signatureEffects = context.cacheApplySignature(
+          effect.signature.aliasing,
+          effect,
+          () =>
+            computeEffectsForSignature(
               state.env,
-              effect.signature.aliasing,
+              signature,
               effect.into,
               effect.receiver,
               effect.args,
               [],
               effect.loc,
-            )
-          : null;
+            ),
+        );
+      }
       if (signatureEffects != null) {
-        if (DEBUG) {
-          console.log('apply aliasing signature effects');
-        }
         for (const signatureEffect of signatureEffects) {
-          applyEffect(context, state, signatureEffect, aliased, effects);
+          applyEffect(context, state, signatureEffect, initialized, effects);
         }
       } else if (effect.signature != null) {
-        if (DEBUG) {
-          console.log('apply legacy signature effects');
-        }
         const legacyEffects = computeEffectsForLegacySignature(
           state,
           effect.signature,
@@ -794,12 +902,9 @@ function applyEffect(
           effect.loc,
         );
         for (const legacyEffect of legacyEffects) {
-          applyEffect(context, state, legacyEffect, aliased, effects);
+          applyEffect(context, state, legacyEffect, initialized, effects);
         }
       } else {
-        if (DEBUG) {
-          console.log('default effects');
-        }
         applyEffect(
           context,
           state,
@@ -809,7 +914,7 @@ function applyEffect(
             value: ValueKind.Mutable,
             reason: ValueReason.Other,
           },
-          aliased,
+          initialized,
           effects,
         );
         /*
@@ -832,21 +937,21 @@ function applyEffect(
                 kind: 'MutateTransitiveConditionally',
                 value: operand,
               },
-              aliased,
+              initialized,
               effects,
             );
           }
           const mutateIterator =
             arg.kind === 'Spread' ? conditionallyMutateIterator(operand) : null;
           if (mutateIterator) {
-            applyEffect(context, state, mutateIterator, aliased, effects);
+            applyEffect(context, state, mutateIterator, initialized, effects);
           }
           applyEffect(
             context,
             state,
             // OK: recording information flow
             {kind: 'Alias', from: operand, into: effect.into},
-            aliased,
+            initialized,
             effects,
           );
           for (const otherArg of [
@@ -874,7 +979,7 @@ function applyEffect(
                 from: operand,
                 into: other,
               },
-              aliased,
+              initialized,
               effects,
             );
           }
@@ -901,48 +1006,89 @@ function applyEffect(
           console.log(prettyFormat(state.debugAbstractValue(value)));
         }
 
-        let reason: string;
-        let description: string | null = null;
-
         if (
           mutationKind === 'mutate-frozen' &&
           context.hoistedContextDeclarations.has(
             effect.value.identifier.declarationId,
           )
         ) {
-          reason = `This variable is accessed before it is declared, which prevents the earlier access from updating when this value changes over time`;
-          if (
+          const description =
             effect.value.identifier.name !== null &&
             effect.value.identifier.name.kind === 'named'
-          ) {
-            description = `Move the declaration of \`${effect.value.identifier.name.value}\` to before it is first referenced`;
+              ? `Variable \`${effect.value.identifier.name.value}\` is accessed before it is declared`
+              : null;
+          const hoistedAccess = context.hoistedContextDeclarations.get(
+            effect.value.identifier.declarationId,
+          );
+          if (hoistedAccess != null && hoistedAccess.loc != effect.value.loc) {
+            applyEffect(
+              context,
+              state,
+              {
+                kind: 'MutateFrozen',
+                place: effect.value,
+                error: {
+                  severity: ErrorSeverity.InvalidReact,
+                  reason: `This variable is accessed before it is declared, which may prevent it from updating as the assigned value changes over time`,
+                  description,
+                  loc: hoistedAccess.loc,
+                  suggestions: null,
+                },
+              },
+              initialized,
+              effects,
+            );
           }
+
+          applyEffect(
+            context,
+            state,
+            {
+              kind: 'MutateFrozen',
+              place: effect.value,
+              error: {
+                severity: ErrorSeverity.InvalidReact,
+                reason: `This variable is accessed before it is declared, which prevents the earlier access from updating when this value changes over time`,
+                description,
+                loc: effect.value.loc,
+                suggestions: null,
+              },
+            },
+            initialized,
+            effects,
+          );
         } else {
-          reason = getWriteErrorReason({
+          const reason = getWriteErrorReason({
             kind: value.kind,
             reason: value.reason,
             context: new Set(),
           });
-          if (
+          const description =
             effect.value.identifier.name !== null &&
             effect.value.identifier.name.kind === 'named'
-          ) {
-            description = `Found mutation of \`${effect.value.identifier.name.value}\``;
-          }
+              ? `Found mutation of \`${effect.value.identifier.name.value}\``
+              : null;
+          applyEffect(
+            context,
+            state,
+            {
+              kind:
+                value.kind === ValueKind.Frozen
+                  ? 'MutateFrozen'
+                  : 'MutateGlobal',
+              place: effect.value,
+              error: {
+                severity: ErrorSeverity.InvalidReact,
+                reason,
+                description,
+                loc: effect.value.loc,
+                suggestions: null,
+              },
+            },
+            initialized,
+            effects,
+          );
         }
-
-        effects.push({
-          kind:
-            value.kind === ValueKind.Frozen ? 'MutateFrozen' : 'MutateGlobal',
-          place: effect.value,
-          error: {
-            severity: ErrorSeverity.InvalidReact,
-            reason,
-            description,
-            loc: effect.value.loc,
-            suggestions: null,
-          },
-        });
       }
       break;
     }
@@ -1046,7 +1192,7 @@ class InferenceState {
   }
 
   // Updates the value at @param place to point to the same value as @param value.
-  alias(place: Place, value: Place): void {
+  assign(place: Place, value: Place): void {
     const values = this.#variables.get(value.identifier.id);
     CompilerError.invariant(values != null, {
       reason: `[InferMutationAliasingEffects] Expected value for identifier to be initialized`,
@@ -1124,9 +1270,6 @@ class InferenceState {
       kind: ValueKind.Frozen,
       reason: new Set([reason]),
     });
-    if (DEBUG) {
-      console.log(`freeze value: ${printInstructionValue(value)} ${reason}`);
-    }
     if (
       value.kind === 'FunctionExpression' &&
       (this.env.config.enablePreserveExistingMemoizationGuarantees ||
@@ -2166,17 +2309,6 @@ function computeEffectsForSignature(
     // Too many args and there is no rest param to hold them
     (args.length > signature.params.length && signature.rest == null)
   ) {
-    if (DEBUG) {
-      if (signature.params.length > args.length) {
-        console.log(
-          `not enough args: ${args.length} args for ${signature.params.length} params`,
-        );
-      } else {
-        console.log(
-          `too many args: ${args.length} args for ${signature.params.length} params, with no rest param`,
-        );
-      }
-    }
     return null;
   }
   // Build substitutions
@@ -2191,9 +2323,6 @@ function computeEffectsForSignature(
       continue;
     } else if (params == null || i >= params.length || arg.kind === 'Spread') {
       if (signature.rest == null) {
-        if (DEBUG) {
-          console.log(`no rest value to hold param`);
-        }
         return null;
       }
       const place = arg.kind === 'Identifier' ? arg : arg.place;
@@ -2301,23 +2430,14 @@ function computeEffectsForSignature(
       case 'Apply': {
         const applyReceiver = substitutions.get(effect.receiver.identifier.id);
         if (applyReceiver == null || applyReceiver.length !== 1) {
-          if (DEBUG) {
-            console.log(`too many substitutions for receiver`);
-          }
           return null;
         }
         const applyFunction = substitutions.get(effect.function.identifier.id);
         if (applyFunction == null || applyFunction.length !== 1) {
-          if (DEBUG) {
-            console.log(`too many substitutions for function`);
-          }
           return null;
         }
         const applyInto = substitutions.get(effect.into.identifier.id);
         if (applyInto == null || applyInto.length !== 1) {
-          if (DEBUG) {
-            console.log(`too many substitutions for into`);
-          }
           return null;
         }
         const applyArgs: Array<Place | SpreadPattern | Hole> = [];
@@ -2327,18 +2447,12 @@ function computeEffectsForSignature(
           } else if (arg.kind === 'Identifier') {
             const applyArg = substitutions.get(arg.identifier.id);
             if (applyArg == null || applyArg.length !== 1) {
-              if (DEBUG) {
-                console.log(`too many substitutions for arg`);
-              }
               return null;
             }
             applyArgs.push(applyArg[0]);
           } else {
             const applyArg = substitutions.get(arg.place.identifier.id);
             if (applyArg == null || applyArg.length !== 1) {
-              if (DEBUG) {
-                console.log(`too many substitutions for arg`);
-              }
               return null;
             }
             applyArgs.push({kind: 'Spread', place: applyArg[0]});
