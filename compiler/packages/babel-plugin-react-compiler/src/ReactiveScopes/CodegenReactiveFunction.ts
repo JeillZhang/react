@@ -61,6 +61,7 @@ export const EARLY_RETURN_SENTINEL = 'react.early_return_sentinel';
 export type CodegenFunction = {
   type: 'CodegenFunction';
   id: t.Identifier | null;
+  nameHint: string | null;
   params: t.FunctionDeclaration['params'];
   body: t.BlockStatement;
   generator: boolean;
@@ -383,6 +384,7 @@ function codegenReactiveFunction(
     type: 'CodegenFunction',
     loc: fn.loc,
     id: fn.id !== null ? t.identifier(fn.id) : null,
+    nameHint: fn.nameHint,
     params,
     body,
     generator: fn.generator,
@@ -2326,6 +2328,7 @@ function codegenInstructionValue(
         ),
         reactiveFunction,
       ).unwrap();
+
       if (instrValue.type === 'ArrowFunctionExpression') {
         let body: t.BlockStatement | t.Expression = fn.body;
         if (body.body.length === 1 && loweredFunc.directives.length == 0) {
@@ -2337,12 +2340,24 @@ function codegenInstructionValue(
         value = t.arrowFunctionExpression(fn.params, body, fn.async);
       } else {
         value = t.functionExpression(
-          fn.id ??
-            (instrValue.name != null ? t.identifier(instrValue.name) : null),
+          instrValue.name != null ? t.identifier(instrValue.name) : null,
           fn.params,
           fn.body,
           fn.generator,
           fn.async,
+        );
+      }
+      if (
+        cx.env.config.enableNameAnonymousFunctions &&
+        instrValue.name == null &&
+        instrValue.nameHint != null
+      ) {
+        const name = instrValue.nameHint;
+        value = t.memberExpression(
+          t.objectExpression([t.objectProperty(t.stringLiteral(name), value)]),
+          t.stringLiteral(name),
+          true,
+          false,
         );
       }
       break;
