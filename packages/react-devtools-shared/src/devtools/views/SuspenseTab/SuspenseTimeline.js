@@ -33,33 +33,12 @@ function SuspenseTimelineInput() {
     selectedRootID: rootID,
     timeline,
     timelineIndex,
+    hoveredTimelineIndex,
     playing,
   } = useContext(SuspenseTreeStateContext);
 
   const min = 0;
   const max = timeline.length > 0 ? timeline.length - 1 : 0;
-
-  if (rootID === null) {
-    return (
-      <div className={styles.SuspenseTimelineInput}>No root selected.</div>
-    );
-  }
-
-  if (!store.supportsTogglingSuspense(rootID)) {
-    return (
-      <div className={styles.SuspenseTimelineInput}>
-        Can't step through Suspense in production apps.
-      </div>
-    );
-  }
-
-  if (timeline.length === 0) {
-    return (
-      <div className={styles.SuspenseTimelineInput}>
-        Root contains no Suspense nodes.
-      </div>
-    );
-  }
 
   function switchSuspenseNode(nextTimelineIndex: number) {
     const nextSelectedSuspenseID = timeline[nextTimelineIndex];
@@ -175,6 +154,28 @@ function SuspenseTimelineInput() {
     };
   }, [playing]);
 
+  if (rootID === null) {
+    return (
+      <div className={styles.SuspenseTimelineInput}>No root selected.</div>
+    );
+  }
+
+  if (!store.supportsTogglingSuspense(rootID)) {
+    return (
+      <div className={styles.SuspenseTimelineInput}>
+        Can't step through Suspense in production apps.
+      </div>
+    );
+  }
+
+  if (timeline.length === 0) {
+    return (
+      <div className={styles.SuspenseTimelineInput}>
+        Root contains no Suspense nodes.
+      </div>
+    );
+  }
+
   return (
     <>
       <Button
@@ -202,6 +203,7 @@ function SuspenseTimelineInput() {
           min={min}
           max={max}
           value={timelineIndex}
+          highlight={hoveredTimelineIndex}
           onBlur={handleBlur}
           onChange={handleChange}
           onFocus={handleFocus}
