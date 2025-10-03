@@ -9,8 +9,6 @@
 import {transformFromAstSync} from '@babel/core';
 import {parse as babelParse} from '@babel/parser';
 import {File} from '@babel/types';
-// @ts-expect-error: no types available
-import PluginProposalPrivateMethods from '@babel/plugin-proposal-private-methods';
 import BabelPluginReactCompiler, {
   parsePluginOptions,
   validateEnvironmentConfig,
@@ -19,7 +17,6 @@ import BabelPluginReactCompiler, {
   LoggerEvent,
 } from 'babel-plugin-react-compiler';
 import type {SourceCode} from 'eslint';
-import * as HermesParser from 'hermes-parser';
 import {isDeepStrictEqual} from 'util';
 import type {ParseResult} from '@babel/parser';
 
@@ -80,7 +77,6 @@ function getFlowSuppressions(
   return results;
 }
 
-
 function runReactCompilerImpl({
   sourceCode,
   filename,
@@ -117,27 +113,14 @@ function runReactCompilerImpl({
   }
 
   let babelAST: ParseResult<File> | null = null;
-  if (filename.endsWith('.tsx') || filename.endsWith('.ts')) {
-    try {
-      babelAST = babelParse(sourceCode.text, {
-        sourceFilename: filename,
-        sourceType: 'unambiguous',
-        plugins: ['typescript', 'jsx'],
-      });
-    } catch {
-      /* empty */
-    }
-  } else {
-    try {
-      babelAST = HermesParser.parse(sourceCode.text, {
-        babel: true,
-        enableExperimentalComponentSyntax: true,
-        sourceFilename: filename,
-        sourceType: 'module',
-      });
-    } catch {
-      /* empty */
-    }
+  try {
+    babelAST = babelParse(sourceCode.text, {
+      sourceFilename: filename,
+      sourceType: 'unambiguous',
+      plugins: ['typescript', 'jsx'],
+    });
+  } catch (err: unknown) {
+    /* empty */
   }
 
   if (babelAST != null) {
@@ -147,10 +130,7 @@ function runReactCompilerImpl({
         filename,
         highlightCode: false,
         retainLines: true,
-        plugins: [
-          [PluginProposalPrivateMethods, {loose: true}],
-          [BabelPluginReactCompiler, options],
-        ],
+        plugins: [[BabelPluginReactCompiler, options]],
         sourceType: 'module',
         configFile: false,
         babelrc: false,
