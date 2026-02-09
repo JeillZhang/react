@@ -2827,6 +2827,40 @@ describe('Store', () => {
       `);
   });
 
+  // @reactVersion >= 19.0
+  it('does not duplicate Server Component parents in keyed Fragments', async () => {
+    // TODO: Use an actual Flight renderer.
+    // See ReactFlight-test for the produced JSX from Flight.
+    function ClientComponent() {
+      return null;
+    }
+    // This used to be a keyed Fragment on the Server.
+    const children = [<ClientComponent key="app" />];
+    children._debugInfo = [
+      {time: 12},
+      {
+        name: 'App',
+        env: 'Server',
+        key: null,
+        stack: '    in Object.<anonymous> (at **)',
+        props: {},
+      },
+      {time: 13},
+    ];
+
+    const container = document.createElement('div');
+    const root = ReactDOMClient.createRoot(container);
+    await actAsync(() => {
+      root.render([children]);
+    });
+
+    expect(store).toMatchInlineSnapshot(`
+      [root]
+        ▾ <App> [Server]
+            <ClientComponent key="app">
+    `);
+  });
+
   // @reactVersion >= 17.0
   it('can reconcile Suspense in fallback positions', async () => {
     let resolveFallback;
@@ -3536,6 +3570,50 @@ describe('Store', () => {
       [suspense-root]  rects={[{x:1,y:2,width:15,height:1}, {x:1,y:2,width:14,height:1}]}
         <Suspense name="outer" rects={[{x:1,y:2,width:15,height:1}, {x:1,y:2,width:14,height:1}]}>
           <Suspense name="inner" rects={[{x:1,y:2,width:14,height:1}]}>
+    `);
+  });
+
+  // @reactVersion >= 19
+  it('can reconcile newly visible Activity with filtered, stable children', async () => {
+    const Activity = React.Activity || React.unstable_Activity;
+
+    function IgnoreMe({children}) {
+      return children;
+    }
+
+    function Component({children}) {
+      return <div>{children}</div>;
+    }
+
+    await actAsync(
+      async () =>
+        (store.componentFilters = [createDisplayNameFilter('^IgnoreMe', true)]),
+    );
+
+    const children = (
+      <IgnoreMe>
+        <Component key="left">Left</Component>
+      </IgnoreMe>
+    );
+
+    await actAsync(() => {
+      render(<Activity mode="hidden">{children}</Activity>);
+    });
+
+    expect(store).toMatchInlineSnapshot(`
+      [root]
+          <Activity>
+    `);
+
+    await actAsync(() => {
+      render(<Activity mode="visible">{children}</Activity>);
+    });
+
+    expect(store).toMatchInlineSnapshot(`
+      [root]
+        ▾ <Activity>
+          ▾ <Component key="left">
+              <div>
     `);
   });
 });
