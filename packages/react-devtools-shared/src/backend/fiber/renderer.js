@@ -991,8 +991,8 @@ function releaseHostResource(
         // eslint-disable-next-line no-for-of-loops/no-for-of-loops
         for (const firstInstance of resourceInstances) {
           publicInstanceToDevToolsInstanceMap.set(
+            publicInstance,
             firstInstance,
-            nearestInstance,
           );
           break;
         }
@@ -3197,15 +3197,16 @@ export function attach(
                 environmentCounts.set(env, count - 1);
               }
             }
-          }
-          if (
-            suspenseNode.hasUniqueSuspenders &&
-            !ioExistsInSuspenseAncestor(suspenseNode, ioInfo)
-          ) {
-            // This entry wasn't in any ancestor and is no longer in this suspense boundary.
-            // This means that a child might now be the unique suspender for this IO.
-            // Search the child boundaries to see if we can reveal any of them.
-            unblockSuspendedBy(suspenseNode, ioInfo);
+
+            if (
+              suspenseNode.hasUniqueSuspenders &&
+              !ioExistsInSuspenseAncestor(suspenseNode, ioInfo)
+            ) {
+              // This entry wasn't in any ancestor and is no longer in this suspense boundary.
+              // This means that a child might now be the unique suspender for this IO.
+              // Search the child boundaries to see if we can reveal any of them.
+              unblockSuspendedBy(suspenseNode, ioInfo);
+            }
           }
         }
       }
@@ -6859,6 +6860,8 @@ export function attach(
 
     // TODO Show custom UI for Cache like we do for Suspense
     // For now, just hide state data entirely since it's not meant to be inspected.
+    // Make sure delete, rename, and override of state handles all tags for which
+    // we show state.
     const showState =
       tag === ClassComponent || tag === IncompleteClassComponent;
 
@@ -7815,8 +7818,13 @@ export function attach(
           }
           break;
         case 'state':
-          deletePathInObject(instance.state, path);
-          instance.forceUpdate();
+          switch (fiber.tag) {
+            case ClassComponent:
+            case IncompleteClassComponent:
+              deletePathInObject(instance.state, path);
+              instance.forceUpdate();
+              break;
+          }
           break;
       }
     }
@@ -7893,8 +7901,13 @@ export function attach(
           }
           break;
         case 'state':
-          renamePathInObject(instance.state, oldPath, newPath);
-          instance.forceUpdate();
+          switch (fiber.tag) {
+            case ClassComponent:
+            case IncompleteClassComponent:
+              renamePathInObject(instance.state, oldPath, newPath);
+              instance.forceUpdate();
+              break;
+          }
           break;
       }
     }
@@ -7964,6 +7977,7 @@ export function attach(
         case 'state':
           switch (fiber.tag) {
             case ClassComponent:
+            case IncompleteClassComponent:
               setInObject(instance.state, path, value);
               instance.forceUpdate();
               break;
